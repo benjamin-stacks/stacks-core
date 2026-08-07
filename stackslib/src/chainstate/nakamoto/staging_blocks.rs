@@ -458,6 +458,50 @@ impl<'a> NakamotoStagingBlocksConnRef<'a> {
             .collect())
     }
 
+    pub fn get_tenures_with_ready_blocks(&self) -> Result<Vec<ConsensusHash>, ChainstateError> {
+        let sql = "select distinct(consensus_hash) from nakamoto_staging_blocks where burn_attachable=1 and orphaned=0 and processed=0";
+        Ok(query_rows::<ConsensusHash, _>(self, sql, NO_PARAMS)?)
+    }
+
+    /// Get the complete tenure (or what's left of it) starting from the first unprocessed block.
+    /// If it's not complete yet (i.e. we don't have the start block of the next tenure here),
+    /// returns nothing.
+    pub fn get_ready_tenure_for_mega_block(&self) -> Result<Vec<NakamotoBlock>, ChainstateError> {
+        let sql = r#"
+            with tbs as (
+                select 1 as is_correct_tenure, child.*
+                    from nakamoto_staging_blocks child
+                    join nakamoto_staging_blocks parent on child.parent_block_id=parent.index_block_hash
+                where child.burn_attachable=1 and child.orphaned=0 and child.processed=0
+                    and parent.processed
+                
+                union
+                select (child.consensus_hash=parent.consensus_hash) as is_correct_tenure, child.*
+                    from nakamoto_staging_blocks child
+					join tbs parent on child.parent_block_id=parent.index_block_hash
+                where child.burn_attachable=1 and child.orphaned=0 and child.processed=0
+					and parent.is_correct_tenure
+            )
+
+            select data 
+				from tbs
+				where is_correct_tenure and exists (select 1 from tbs where not is_correct_tenure)
+			order by height
+        "#;
+        let mut stmt = self.prepare_cached(sql)?;
+        let result =
+            stmt.query_and_then(NO_PARAMS, |row| -> Result<NakamotoBlock, ChainstateError> {
+                let data: Vec<u8> = row
+                    .get("data")
+                    .map_err(|_| ChainstateError::InvalidChainstateDB)?;
+                let block = NakamotoBlock::consensus_deserialize(&mut data.as_slice())
+                    .map_err(|e| ChainstateError::CodecError(e))?;
+                Ok(block)
+            })?;
+
+        Ok(result.filter_map(|r| r.ok()).collect())
+    }
+
     /// Find the next ready-to-process Nakamoto block, given a connection to the staging blocks DB.
     /// NOTE: the relevant field queried from `nakamoto_staging_blocks` are updated by a separate
     /// tx from block-processing, so it's imperative that the thread that calls this function is

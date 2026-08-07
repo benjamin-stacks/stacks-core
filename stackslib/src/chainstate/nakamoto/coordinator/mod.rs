@@ -15,9 +15,15 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::collections::VecDeque;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use clarity::boot_util::boot_code_id;
+use clarity::types::chainstate::ConsensusHash;
+use clarity::util;
+use stacks_codec::StacksMessageCodec;
 use stacks_common::types::chainstate::{
     BlockHeaderHash, BurnchainHeaderHash, SortitionId, StacksBlockId,
 };
@@ -36,12 +42,16 @@ use crate::chainstate::coordinator::{
     Error, OnChainRewardSetProvider, PaidRewards, PoxAnchorBlockStatus, RewardCycleInfo,
     RewardSetProvider,
 };
+use crate::chainstate::nakamoto::miner::{MinerTenureInfoCause, NakamotoBlockBuilder};
 use crate::chainstate::nakamoto::NakamotoChainState;
 use crate::chainstate::stacks::boot::{RewardSet, SIGNERS_NAME};
 use crate::chainstate::stacks::db::{
     StacksBlockHeaderTypes, StacksChainState, StacksDBConn, StacksHeaderInfo,
 };
-use crate::chainstate::stacks::miner::{signal_mining_blocked, signal_mining_ready, MinerStatus};
+use crate::chainstate::stacks::miner::{
+    signal_mining_blocked, signal_mining_ready, BlockBuilder, MinerStatus,
+    TransactionResourceBudgets,
+};
 use crate::chainstate::stacks::Error as ChainstateError;
 use crate::clarity_vm::database::HeadersDBConn;
 use crate::cost_estimates::{CostEstimator, FeeEstimator};
@@ -802,46 +812,231 @@ impl<
             )
         })?;
 
+        let mut mega_mined_tenure: Option<ConsensusHash> = None;
+        let mut previous_actual_processing_ms = 0u128;
+
         loop {
             Self::fault_injection_pause_nakamoto_block_processing();
+            let staging_db = self.chain_state_db.nakamoto_blocks_db();
+            let tenures = staging_db.get_tenures_with_ready_blocks();
+            let tenure_count = tenures?.len();
+            info!("found {tenure_count} tenures with ready blocks");
+            if tenure_count < 2 {
+                break;
+            }
+            let ready_tenure_blocks = staging_db.get_ready_tenure_for_mega_block()?;
+            info!(
+                "found {} ready blocks that share the tenure",
+                ready_tenure_blocks.len()
+            );
+            if ready_tenure_blocks.is_empty() {
+                break;
+            }
+            let mega_mining_tenure = ready_tenure_blocks[0].header.consensus_hash.clone();
+            let is_different = mega_mined_tenure
+                .clone()
+                .is_none_or(|ch| ch != mega_mining_tenure);
+            if !is_different {
+                info!("megablock already mined for that tenure")
+            } else {
+                mega_mined_tenure = Some(mega_mining_tenure.clone());
+                let txs: Vec<_> = ready_tenure_blocks
+                    .iter()
+                    .flat_map(|b| b.txs.iter())
+                    .collect();
+                let tx_count = txs.len();
+                let first_block = ready_tenure_blocks.first().expect("checked not empty");
+                let parent_header = NakamotoChainState::get_block_header(
+                    &self.chain_state_db.index_conn(),
+                    &first_block.header.parent_block_id,
+                )?
+                .expect(
+                    format!(
+                        "parent block {} is processed, must have a header",
+                        first_block.header.parent_block_id
+                    )
+                    .as_str(),
+                );
+
+                let mut builder = NakamotoBlockBuilder::new(
+                    &parent_header,
+                    &first_block.header.consensus_hash,
+                    0,
+                    None,
+                    None,
+                    0,
+                    None,
+                    None,
+                    None,
+                    20000000,
+                )?;
+                let burnchain_view_sn = SortitionDB::get_block_snapshot_consensus(
+                    self.sortition_db.conn(),
+                    &first_block.header.consensus_hash,
+                )?
+                .expect("sortition exists");
+                let burn_view_handle = self
+                    .sortition_db
+                    .index_handle(&burnchain_view_sn.sortition_id);
+
+                let mut miner_tenure_info = builder.load_tenure_info(
+                    &mut self.chain_state_db,
+                    &burn_view_handle,
+                    MinerTenureInfoCause::NoTenureChange,
+                )?;
+                let burn_height = miner_tenure_info.burn_tip_height;
+                let mut clarity_tx =
+                    builder.tenure_begin(&burn_view_handle, &mut miner_tenure_info)?;
+                let start_cost = clarity_tx.cost_so_far();
+                let start = Instant::now();
+
+                for tx in txs {
+                    _ = builder.try_mine_tx(
+                        &mut clarity_tx,
+                        &tx,
+                        &TransactionResourceBudgets::unlimited(),
+                        &mut 0,
+                    );
+                }
+                let tx_time = start.elapsed().as_millis();
+                let start = Instant::now();
+                let block = builder.mine_nakamoto_block(&mut clarity_tx, burn_height);
+                let block_time = start.elapsed().as_millis();
+                let finish_epoch_s = util::get_epoch_time_secs();
+                let end_cost = clarity_tx.cost_so_far();
+                let mut block_cost = end_cost.clone();
+                _ = block_cost.sub(&start_cost);
+
+                clarity_tx.rollback_block();
+                info!("Mined MEGA block with {}/{} transactions, tx_time = {tx_time} ms, block_time = {block_time} ms", block.txs.len(), tx_count);
+
+                let mut file = OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open("megablocks.txt")
+                    .unwrap();
+
+                _ = file.write_all(
+                    &format!(
+                        r#"Consensus hash: {}{}
+Heights: {} to {} ({} blocks)
+First block timestamp: {}
+Source transactions: {}
+Mined transactions: {}
+Transaction mining time: {} ms
+Block building time: {} ms
+Cost:
+  Runtime: {}
+  Read count: {}
+  Read length: {}
+  Write count: {}
+  Write length: {}
+Block size: {}
+Finished at: {}
+Previous actual processing: {} ms
+
+"#,
+                        first_block.header.consensus_hash,
+                        if first_block.is_wellformed_tenure_start_block().unwrap() {
+                            ""
+                        } else {
+                            " (incomplete)"
+                        },
+                        first_block.header.chain_length,
+                        ready_tenure_blocks.last().unwrap().header.chain_length,
+                        ready_tenure_blocks.len(),
+                        first_block.header.timestamp,
+                        tx_count,
+                        block.txs.len(),
+                        tx_time,
+                        block_time,
+                        block_cost.runtime,
+                        block_cost.read_count,
+                        block_cost.read_length,
+                        block_cost.write_count,
+                        block_cost.write_length,
+                        block.serialize_to_vec().len(),
+                        finish_epoch_s,
+                        previous_actual_processing_ms
+                    )
+                    .into_bytes(),
+                );
+
+                let mut csv_file = OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open("megablocks.csv")
+                    .unwrap();
+
+                // tenure begin timestamp,tenure,first height,last height,source txs,mined txs,tx mining time ms,block mining time ms,runtime,read count,read length,write count,write length,block size,done timestamp,prev act proc ms
+
+                _ = csv_file.write_all(
+                    &format!(
+                        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}
+",
+                        first_block.header.timestamp,
+                        first_block.header.consensus_hash,
+                        first_block.header.chain_length,
+                        ready_tenure_blocks.last().unwrap().header.chain_length,
+                        tx_count,
+                        block.txs.len(),
+                        tx_time,
+                        block_time,
+                        block_cost.runtime,
+                        block_cost.read_count,
+                        block_cost.read_length,
+                        block_cost.write_count,
+                        block_cost.write_length,
+                        block.serialize_to_vec().len(),
+                        finish_epoch_s,
+                        previous_actual_processing_ms
+                    )
+                    .into_bytes(),
+                );
+                previous_actual_processing_ms = 0;
+            }
 
             // process at most one block per loop pass
-            let mut processed_block_receipt = match NakamotoChainState::process_next_nakamoto_block(
-                &mut self.chain_state_db,
-                &mut self.sortition_db,
-                &canonical_sortition_tip,
-                self.dispatcher,
-                self.config.txindex,
-            ) {
-                Ok(receipt_opt) => receipt_opt,
-                Err(ChainstateError::InvalidStacksBlock(msg)) => {
-                    warn!("Encountered invalid block: {}", &msg);
+            let start_actual = Instant::now();
+            let mut processed_block_receipt =
+                match NakamotoChainState::process_next_nakamoto_block_if_in_tenure(
+                    &mut self.chain_state_db,
+                    &mut self.sortition_db,
+                    &canonical_sortition_tip,
+                    self.dispatcher,
+                    self.config.txindex,
+                    mega_mined_tenure.clone(),
+                ) {
+                    Ok(receipt_opt) => receipt_opt,
+                    Err(ChainstateError::InvalidStacksBlock(msg)) => {
+                        warn!("Encountered invalid block: {}", &msg);
 
-                    // try again
-                    self.notifier.notify_stacks_block_processed();
-                    increment_stx_blocks_processed_counter();
-                    continue;
-                }
-                Err(ChainstateError::NetError(NetError::DeserializeError(msg))) => {
-                    // happens if we load a zero-sized block (i.e. an invalid block)
-                    warn!("Encountered invalid block (codec error): {}", &msg);
+                        // try again
+                        self.notifier.notify_stacks_block_processed();
+                        increment_stx_blocks_processed_counter();
+                        continue;
+                    }
+                    Err(ChainstateError::NetError(NetError::DeserializeError(msg))) => {
+                        // happens if we load a zero-sized block (i.e. an invalid block)
+                        warn!("Encountered invalid block (codec error): {}", &msg);
 
-                    // try again
-                    self.notifier.notify_stacks_block_processed();
-                    increment_stx_blocks_processed_counter();
-                    continue;
-                }
-                Err(e) => {
-                    // something else happened
-                    return Err(e.into());
-                }
-            };
+                        // try again
+                        self.notifier.notify_stacks_block_processed();
+                        increment_stx_blocks_processed_counter();
+                        continue;
+                    }
+                    Err(e) => {
+                        // something else happened
+                        return Err(e.into());
+                    }
+                };
 
             let Some(block_receipt) = processed_block_receipt.take() else {
                 // out of blocks
                 debug!("No more blocks to process (no receipts)");
                 break;
             };
+            previous_actual_processing_ms += start_actual.elapsed().as_millis();
 
             if block_receipt.signers_updated {
                 // notify p2p thread via globals

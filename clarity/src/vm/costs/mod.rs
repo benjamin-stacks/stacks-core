@@ -799,6 +799,8 @@ impl LimitedCostTracker {
         clarity_db: &mut ClarityDatabase,
         epoch: StacksEpochId,
     ) -> Result<LimitedCostTracker, CostErrors> {
+        let mut limit = limit.clone();
+        limit.multiply(10).unwrap();
         let mut cost_tracker = TrackerData {
             cost_function_references: HashMap::new(),
             cost_contracts: HashMap::new(),
@@ -823,6 +825,8 @@ impl LimitedCostTracker {
         clarity_db: &mut ClarityDatabase,
         epoch: StacksEpochId,
     ) -> Result<LimitedCostTracker, CostErrors> {
+        let mut limit = limit.clone();
+        limit.multiply(10).unwrap();
         let mut cost_tracker = TrackerData {
             cost_function_references: HashMap::new(),
             cost_contracts: HashMap::new(),
@@ -909,7 +913,8 @@ impl LimitedCostTracker {
             );
             cost_functions.insert(each, evaluator);
         }
-
+        let mut limit = limit.clone();
+        limit.multiply(10).unwrap();
         let cost_tracker = TrackerData {
             cost_function_references: cost_functions,
             cost_contracts: HashMap::new(),

@@ -2277,9 +2277,26 @@ impl NakamotoChainState {
         dispatcher_opt: Option<&T>,
         txindex: bool,
     ) -> Result<Option<StacksEpochReceipt>, ChainstateError> {
+        Self::process_next_nakamoto_block_if_in_tenure(
+            stacks_chain_state,
+            sort_db,
+            canonical_sortition_tip,
+            dispatcher_opt,
+            txindex,
+            None,
+        )
+    }
+
+    pub fn process_next_nakamoto_block_if_in_tenure<T: BlockEventDispatcher>(
+        stacks_chain_state: &mut StacksChainState,
+        sort_db: &mut SortitionDB,
+        canonical_sortition_tip: &SortitionId,
+        dispatcher_opt: Option<&T>,
+        txindex: bool,
+        tenure: Option<ConsensusHash>,
+    ) -> Result<Option<StacksEpochReceipt>, ChainstateError> {
         #[cfg(test)]
         fault_injection::stall_block_processing();
-
         let nakamoto_blocks_db = stacks_chain_state.nakamoto_blocks_db();
         let Some((next_ready_block, block_size)) =
             nakamoto_blocks_db.next_ready_nakamoto_block(stacks_chain_state.db())?
@@ -2288,6 +2305,11 @@ impl NakamotoChainState {
             test_debug!("No more Nakamoto blocks to process");
             return Ok(None);
         };
+
+        if tenure.is_some_and(|ch| ch != next_ready_block.header.consensus_hash) {
+            test_debug!("Next block to process is not in requested tenure");
+            return Ok(None);
+        }
 
         let block_id = next_ready_block.block_id();
 

@@ -23,6 +23,7 @@ use std::time::Instant;
 use clarity::boot_util::boot_code_id;
 use clarity::types::chainstate::ConsensusHash;
 use clarity::util;
+use rusqlite::{params, OpenFlags};
 use stacks_codec::StacksMessageCodec;
 use stacks_common::types::chainstate::{
     BlockHeaderHash, BurnchainHeaderHash, SortitionId, StacksBlockId,
@@ -57,7 +58,7 @@ use crate::clarity_vm::database::HeadersDBConn;
 use crate::cost_estimates::{CostEstimator, FeeEstimator};
 use crate::monitoring::increment_stx_blocks_processed_counter;
 use crate::net::Error as NetError;
-use crate::util_lib::db::Error as DBError;
+use crate::util_lib::db::{sqlite_open, table_exists, Error as DBError};
 
 #[cfg(any(test, feature = "testing"))]
 pub static TEST_COORDINATOR_STALL: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
@@ -83,6 +84,26 @@ macro_rules! inf_or_debug {
             info!($($arg)*)
         }
     })
+}
+
+struct MegaBlock {
+    tenure_begin_ts: u64,
+    tenure: ConsensusHash,
+    first_height: u64,
+    last_height: u64,
+    source_txs: usize,
+    mined_txs: usize,
+    tx_mining_time_ms: u64,
+    block_mining_time_ms: u64,
+    cost_runtime: u64,
+    cost_read_count: u64,
+    cost_read_length: u64,
+    cost_write_count: u64,
+    cost_write_length: u64,
+    block_size: usize,
+    done_ts: u64,
+    act_proc_ms: Option<u64>,
+    index_in_run: u64,
 }
 
 impl<T: BlockEventDispatcher> OnChainRewardSetProvider<'_, T> {
@@ -796,6 +817,102 @@ impl<
         }
     }
 
+    fn open_megablocks_db() -> rusqlite::Connection {
+        let conn = sqlite_open(
+            "megablocks.db",
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+            true,
+        )
+        .unwrap();
+        if !table_exists(&conn, "megablocks").unwrap() {
+            conn.execute(
+                r#"
+                CREATE TABLE "megablocks" (
+                    "tenure_begin_ts"	INTEGER NOT NULL,
+                    "tenure"	TEXT NOT NULL,
+                    "first_height"	INTEGER NOT NULL,
+                    "last_height"	INTEGER NOT NULL,
+                    "source_txs"	INTEGER NOT NULL,
+                    "mined_txs"	INTEGER NOT NULL,
+                    "tx_mining_time_ms"	INTEGER NOT NULL,
+                    "block_mining_time_ms"	INTEGER NOT NULL,
+                    "cost_runtime"	INTEGER NOT NULL,
+                    "cost_read_count"	INTEGER NOT NULL,
+                    "cost_read_length"	INTEGER NOT NULL,
+                    "cost_write_count"	INTEGER NOT NULL,
+                    "cost_write_length"	INTEGER NOT NULL,
+                    "block_size"	INTEGER NOT NULL,
+                    "done_ts"	INTEGER NOT NULL,
+                    "act_proc_ms"	INTEGER,
+                    "index_in_run"	INTEGER NOT NULL
+                );"#,
+                params![],
+            )
+            .unwrap();
+            conn.execute(
+                r#"
+                CREATE INDEX "megablocks_first_height" ON "megablocks" (
+                    "first_height"
+                );
+                "#,
+                params![],
+            )
+            .unwrap();
+            conn.execute(
+                r#"
+                CREATE INDEX "megablocks_last_height" ON "megablocks" (
+                    "last_height"
+                );       
+            "#,
+                params![],
+            )
+            .unwrap();
+        }
+
+        conn
+    }
+
+    fn insert_megablock(
+        conn: &rusqlite::Connection,
+        megablock: &MegaBlock,
+    ) -> Result<(), ChainstateError> {
+        let sql = "insert into megablocks(tenure_begin_ts,tenure,first_height,last_height,source_txs,mined_txs,tx_mining_time_ms,block_mining_time_ms,cost_runtime,cost_read_count,cost_read_length,cost_write_count,cost_write_length,block_size,done_ts,act_proc_ms,index_in_run)
+                             values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+        conn.prepare_cached(sql).and_then(|mut stmt| {
+            stmt.execute(params![
+                megablock.tenure_begin_ts,
+                megablock.tenure,
+                megablock.first_height,
+                megablock.last_height,
+                megablock.source_txs,
+                megablock.mined_txs,
+                megablock.tx_mining_time_ms,
+                megablock.block_mining_time_ms,
+                megablock.cost_runtime,
+                megablock.cost_read_count,
+                megablock.cost_read_length,
+                megablock.cost_write_count,
+                megablock.cost_write_length,
+                megablock.block_size,
+                megablock.done_ts,
+                megablock.act_proc_ms,
+                megablock.index_in_run
+            ])
+        })?;
+
+        Ok(())
+    }
+
+    fn update_megablock_actual_processing_time(
+        conn: &rusqlite::Connection,
+        tenure: &ConsensusHash,
+        act_proc_ms: u64,
+    ) -> Result<(), ChainstateError> {
+        conn.prepare_cached("update megablocks set act_proc_ms=? where tenure=?")
+            .and_then(|mut stmt| stmt.execute(params![act_proc_ms, tenure]))?;
+        Ok(())
+    }
+
     #[cfg(not(any(test, feature = "testing")))]
     fn fault_injection_pause_nakamoto_block_processing() {}
 
@@ -812,8 +929,7 @@ impl<
             )
         })?;
 
-        let mut mega_mined_tenure: Option<ConsensusHash> = None;
-        let mut previous_actual_processing_ms = 0u128;
+        let megablock_db = Self::open_megablocks_db();
 
         loop {
             Self::fault_injection_pause_nakamoto_block_processing();
@@ -821,8 +937,19 @@ impl<
             let tenures = staging_db.get_tenures_with_ready_blocks();
             let tenure_count = tenures?.len();
             info!("found {tenure_count} tenures with ready blocks");
-            if tenure_count < 2 {
+            if tenure_count < 3 {
+                self.mega_block_waiting = true;
                 break;
+            }
+            if self.mega_block_waiting {
+                if tenure_count >= 20 {
+                    self.mega_block_waiting = false;
+                    self.next_mega_block_index = 1;
+                } else {
+                    info!("not continuing until there are 20");
+
+                    break;
+                }
             }
             let ready_tenure_blocks = staging_db.get_ready_tenure_for_mega_block()?;
             info!(
@@ -833,13 +960,21 @@ impl<
                 break;
             }
             let mega_mining_tenure = ready_tenure_blocks[0].header.consensus_hash.clone();
-            let is_different = mega_mined_tenure
+            let is_different = self
+                .mega_mined_tenure
                 .clone()
                 .is_none_or(|ch| ch != mega_mining_tenure);
             if !is_different {
                 info!("megablock already mined for that tenure")
             } else {
-                mega_mined_tenure = Some(mega_mining_tenure.clone());
+                if let Some(ref previous) = self.mega_mined_tenure {
+                    Self::update_megablock_actual_processing_time(
+                        &megablock_db,
+                        previous,
+                        self.previous_actual_processing_ms as u64,
+                    )?;
+                }
+                self.mega_mined_tenure = Some(mega_mining_tenure.clone());
                 let txs: Vec<_> = ready_tenure_blocks
                     .iter()
                     .flat_map(|b| b.txs.iter())
@@ -957,7 +1092,7 @@ Previous actual processing: {} ms
                         block_cost.write_length,
                         block.serialize_to_vec().len(),
                         finish_epoch_s,
-                        previous_actual_processing_ms
+                        self.previous_actual_processing_ms
                     )
                     .into_bytes(),
                 );
@@ -989,11 +1124,36 @@ Previous actual processing: {} ms
                         block_cost.write_length,
                         block.serialize_to_vec().len(),
                         finish_epoch_s,
-                        previous_actual_processing_ms
+                        self.previous_actual_processing_ms
                     )
                     .into_bytes(),
                 );
-                previous_actual_processing_ms = 0;
+
+                let megablock = MegaBlock {
+                    tenure_begin_ts: first_block.header.timestamp,
+                    tenure: first_block.header.consensus_hash.clone(),
+                    first_height: first_block.header.chain_length,
+                    last_height: ready_tenure_blocks.last().unwrap().header.chain_length,
+                    source_txs: tx_count,
+                    mined_txs: block.txs.len(),
+                    tx_mining_time_ms: tx_time as u64,
+                    block_mining_time_ms: block_time as u64,
+                    cost_runtime: block_cost.runtime,
+                    cost_read_count: block_cost.read_count,
+                    cost_read_length: block_cost.read_length,
+                    cost_write_count: block_cost.write_count,
+                    cost_write_length: block_cost.write_length,
+                    block_size: block.serialize_to_vec().len(),
+                    done_ts: finish_epoch_s,
+                    act_proc_ms: None,
+                    index_in_run: self.next_mega_block_index,
+                };
+
+                self.next_mega_block_index += 1;
+
+                Self::insert_megablock(&megablock_db, &megablock)?;
+
+                self.previous_actual_processing_ms = 0;
             }
 
             // process at most one block per loop pass
@@ -1005,7 +1165,7 @@ Previous actual processing: {} ms
                     &canonical_sortition_tip,
                     self.dispatcher,
                     self.config.txindex,
-                    mega_mined_tenure.clone(),
+                    self.mega_mined_tenure.clone(),
                 ) {
                     Ok(receipt_opt) => receipt_opt,
                     Err(ChainstateError::InvalidStacksBlock(msg)) => {
@@ -1036,7 +1196,7 @@ Previous actual processing: {} ms
                 debug!("No more blocks to process (no receipts)");
                 break;
             };
-            previous_actual_processing_ms += start_actual.elapsed().as_millis();
+            self.previous_actual_processing_ms += start_actual.elapsed().as_millis();
 
             if block_receipt.signers_updated {
                 // notify p2p thread via globals

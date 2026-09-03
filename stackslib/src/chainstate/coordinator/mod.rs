@@ -228,6 +228,10 @@ pub struct ChainsCoordinator<
     pub refresh_stacker_db: Arc<AtomicBool>,
     /// whether or not the canonical tip is now a Nakamoto header
     pub in_nakamoto_epoch: bool,
+    pub mega_block_waiting: bool,
+    pub mega_mined_tenure: Option<ConsensusHash>,
+    pub previous_actual_processing_ms: u128,
+    pub next_mega_block_index: u64,
 }
 
 #[derive(Debug)]
@@ -516,6 +520,10 @@ impl<
             burnchain_indexer,
             refresh_stacker_db: comms.refresh_stacker_db.clone(),
             in_nakamoto_epoch: false,
+            mega_block_waiting: true,
+            mega_mined_tenure: None,
+            previous_actual_processing_ms: 0,
+            next_mega_block_index: 1,
         };
 
         loop {
@@ -681,6 +689,10 @@ impl<T: BlockEventDispatcher, U: RewardSetProvider, B: BurnchainHeaderReader>
             burnchain_indexer,
             refresh_stacker_db: Arc::new(AtomicBool::new(false)),
             in_nakamoto_epoch: false,
+            mega_block_waiting: true,
+            mega_mined_tenure: None,
+            previous_actual_processing_ms: 0,
+            next_mega_block_index: 1,
         }
     }
 }

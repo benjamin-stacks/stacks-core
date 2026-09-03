@@ -492,7 +492,7 @@ pub struct StacksBlockBuilder {
 }
 
 // maximum amount of data a leader can send during its epoch (2MB)
-pub const MAX_EPOCH_SIZE: u32 = 2 * 1024 * 1024;
+pub const MAX_EPOCH_SIZE: u32 = 20 * 1024 * 1024;
 
 // maximum microblock size is 64KB, but note that the current leader has a space budget of
 // $MAX_EPOCH_SIZE bytes (so the average microblock size needs to be 4kb if there are 256 of them)

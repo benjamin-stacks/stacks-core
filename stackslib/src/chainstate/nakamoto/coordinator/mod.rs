@@ -985,6 +985,9 @@ impl<
             )
         })?;
 
+        let mut actual_processing_ms = 0u128;
+        let mut mega_mined_tenure: Option<ConsensusHash> = None;
+
         let megablock_db = Self::open_megablocks_db();
 
         loop {
@@ -1016,21 +1019,13 @@ impl<
                 break;
             }
             let mega_mining_tenure = ready_tenure_blocks[0].header.consensus_hash.clone();
-            let is_different = self
-                .mega_mined_tenure
+            let is_different = mega_mined_tenure
                 .clone()
                 .is_none_or(|ch| ch != mega_mining_tenure);
             if !is_different {
                 info!("megablock already mined for that tenure")
             } else {
-                if let Some(ref previous) = self.mega_mined_tenure {
-                    Self::update_megablock_actual_processing_time(
-                        &megablock_db,
-                        previous,
-                        self.previous_actual_processing_ms as u64,
-                    )?;
-                }
-                self.mega_mined_tenure = Some(mega_mining_tenure.clone());
+                mega_mined_tenure = Some(mega_mining_tenure.clone());
                 let txs: Vec<_> = ready_tenure_blocks
                     .iter()
                     .flat_map(|b| b.txs.iter())
@@ -1124,7 +1119,6 @@ Cost:
   Write length: {}
 Block size: {}
 Finished at: {}
-Previous actual processing: {} ms
 
 "#,
                         first_block.header.consensus_hash,
@@ -1148,7 +1142,6 @@ Previous actual processing: {} ms
                         block_cost.write_length,
                         block.serialize_to_vec().len(),
                         finish_epoch_s,
-                        self.previous_actual_processing_ms
                     )
                     .into_bytes(),
                 );
@@ -1159,11 +1152,11 @@ Previous actual processing: {} ms
                     .open("megablocks.csv")
                     .unwrap();
 
-                // tenure begin timestamp,tenure,first height,last height,source txs,mined txs,tx mining time ms,block mining time ms,runtime,read count,read length,write count,write length,block size,done timestamp,prev act proc ms
+                // tenure begin timestamp,tenure,first height,last height,source txs,mined txs,tx mining time ms,block mining time ms,runtime,read count,read length,write count,write length,block size,done timestamp
 
                 _ = csv_file.write_all(
                     &format!(
-                        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}
+                        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}
 ",
                         first_block.header.timestamp,
                         first_block.header.consensus_hash,
@@ -1180,7 +1173,6 @@ Previous actual processing: {} ms
                         block_cost.write_length,
                         block.serialize_to_vec().len(),
                         finish_epoch_s,
-                        self.previous_actual_processing_ms
                     )
                     .into_bytes(),
                 );
@@ -1201,7 +1193,7 @@ Previous actual processing: {} ms
                     cost_write_length: block_cost.write_length,
                     block_size: block.serialize_to_vec().len(),
                     done_ts: finish_epoch_s,
-                    act_proc_ms: None,
+                    act_proc_ms: None, // will be updated afterwards
                     index_in_run: self.next_mega_block_index,
                 };
 
@@ -1209,7 +1201,7 @@ Previous actual processing: {} ms
 
                 Self::insert_megablock(&megablock_db, &megablock)?;
 
-                self.previous_actual_processing_ms = 0;
+                actual_processing_ms = 0;
             }
 
             // process at most one block per loop pass
@@ -1221,7 +1213,7 @@ Previous actual processing: {} ms
                     &canonical_sortition_tip,
                     self.dispatcher,
                     self.config.txindex,
-                    self.mega_mined_tenure.clone(),
+                    mega_mined_tenure.clone(),
                 ) {
                     Ok(receipt_opt) => receipt_opt,
                     Err(ChainstateError::InvalidStacksBlock(msg)) => {
@@ -1252,7 +1244,18 @@ Previous actual processing: {} ms
                 debug!("No more blocks to process (no receipts)");
                 break;
             };
-            self.previous_actual_processing_ms += start_actual.elapsed().as_millis();
+            actual_processing_ms += start_actual.elapsed().as_millis();
+
+            if ready_tenure_blocks.len() == 1 {
+                // it was the last block
+                if let Some(ref tenure) = mega_mined_tenure {
+                    Self::update_megablock_actual_processing_time(
+                        &megablock_db,
+                        tenure,
+                        actual_processing_ms as u64,
+                    )?;
+                }
+            }
 
             if block_receipt.signers_updated {
                 // notify p2p thread via globals

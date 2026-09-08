@@ -44,7 +44,7 @@ use crate::chainstate::coordinator::{
     RewardSetProvider,
 };
 use crate::chainstate::nakamoto::miner::{MinerTenureInfoCause, NakamotoBlockBuilder};
-use crate::chainstate::nakamoto::NakamotoChainState;
+use crate::chainstate::nakamoto::{NakamotoBlock, NakamotoChainState};
 use crate::chainstate::stacks::boot::{RewardSet, SIGNERS_NAME};
 use crate::chainstate::stacks::db::{
     StacksBlockHeaderTypes, StacksChainState, StacksDBConn, StacksHeaderInfo,
@@ -987,6 +987,7 @@ impl<
 
         let mut actual_processing_ms = 0u128;
         let mut mega_mined_tenure: Option<ConsensusHash> = None;
+        let mut separated_tenure_start: Option<NakamotoBlock> = None;
 
         let megablock_db = Self::open_megablocks_db();
 
@@ -1001,16 +1002,16 @@ impl<
                 break;
             }
             if self.mega_block_waiting {
-                if tenure_count >= 20 {
+                if tenure_count >= 22 {
                     self.mega_block_waiting = false;
                     self.next_mega_block_index = 1;
                 } else {
-                    info!("not continuing until there are 20");
+                    info!("not continuing until there are 22");
 
                     break;
                 }
             }
-            let ready_tenure_blocks = staging_db.get_ready_tenure_for_mega_block()?;
+            let mut ready_tenure_blocks = staging_db.get_ready_tenure_for_mega_block()?.to_vec();
             info!(
                 "found {} ready blocks that share the tenure",
                 ready_tenure_blocks.len()
@@ -1019,11 +1020,68 @@ impl<
                 break;
             }
             let mega_mining_tenure = ready_tenure_blocks[0].header.consensus_hash.clone();
+            let first_block_is_tenure_start = ready_tenure_blocks[0]
+                .is_wellformed_tenure_start_block()
+                .unwrap_or(false)
+                && ready_tenure_blocks[0].tx_count() == 2;
+            let mut source_tx_count_add = 0;
+
             let is_different = mega_mined_tenure
                 .clone()
                 .is_none_or(|ch| ch != mega_mining_tenure);
+
+            if first_block_is_tenure_start {
+                if let Some(start_block) = separated_tenure_start {
+                    info!("Separated tenure start block {} is still around on new tenure {} -- previous tenure only had the start block. Persisting mega block entry.", start_block.header.consensus_hash, mega_mining_tenure);
+                    let megablock = MegaBlock {
+                        tenure_begin_ts: start_block.header.timestamp,
+                        tenure: start_block.header.consensus_hash.clone(),
+                        first_height: start_block.header.chain_length,
+                        last_height: start_block.header.chain_length,
+                        source_txs: start_block.tx_count(),
+                        mined_txs: 0,
+                        tx_mining_time_ms: 0,
+                        block_mining_time_ms: 0,
+                        cost_runtime: 0,
+                        cost_read_count: 0,
+                        cost_read_length: 0,
+                        cost_write_count: 0,
+                        cost_write_length: 0,
+                        block_size: 0,
+                        done_ts: util::get_epoch_time_secs(),
+                        act_proc_ms: Some(actual_processing_ms as u64),
+                        index_in_run: self.next_mega_block_index,
+                    };
+                    actual_processing_ms = 0;
+                    self.next_mega_block_index += 1;
+                    Self::insert_megablock(&megablock_db, &megablock)?;
+                }
+                // old one handled, if any -- now set the new one
+                separated_tenure_start = Some(ready_tenure_blocks.remove(0));
+            } else if let Some(start_block) = separated_tenure_start {
+                if start_block.header.consensus_hash == mega_mining_tenure {
+                    // Standard case: the leftover tenure start is the one for this very tenure, and it has been appended.
+                    info!("tenure start processed, mining megablock");
+                    source_tx_count_add = start_block.tx_count();
+                } else {
+                    warn!("leftover start block doesn't match tenure even though there was no new tenure start -- THIS IS A BUG");
+                }
+                separated_tenure_start = None;
+            } else {
+                if is_different {
+                    warn!("first block is not a tenure start, and there's also no leftover start block -- this shouldn't happen (unless this chainstate has previously been processed by a regular node)")
+                }
+            }
+
+            if is_different {
+                // this _should_ not be necessary, but that's famous last words
+                actual_processing_ms = 0;
+            }
+
             if !is_different {
-                info!("megablock already mined for that tenure")
+                info!("megablock already mined for that tenure, appending to chainstate now");
+            } else if separated_tenure_start.is_some() {
+                info!("processing tenure start block before mining mega block");
             } else {
                 mega_mined_tenure = Some(mega_mining_tenure.clone());
                 let txs: Vec<_> = ready_tenure_blocks
@@ -1131,7 +1189,7 @@ Finished at: {}
                         ready_tenure_blocks.last().unwrap().header.chain_length,
                         ready_tenure_blocks.len(),
                         first_block.header.timestamp,
-                        tx_count,
+                        tx_count + source_tx_count_add,
                         block.txs.len(),
                         tx_time,
                         block_time,
@@ -1162,7 +1220,7 @@ Finished at: {}
                         first_block.header.consensus_hash,
                         first_block.header.chain_length,
                         ready_tenure_blocks.last().unwrap().header.chain_length,
-                        tx_count,
+                        tx_count + source_tx_count_add,
                         block.txs.len(),
                         tx_time,
                         block_time,
@@ -1182,7 +1240,7 @@ Finished at: {}
                     tenure: first_block.header.consensus_hash.clone(),
                     first_height: first_block.header.chain_length,
                     last_height: ready_tenure_blocks.last().unwrap().header.chain_length,
-                    source_txs: tx_count,
+                    source_txs: tx_count + source_tx_count_add,
                     mined_txs: block.txs.len(),
                     tx_mining_time_ms: tx_time as u64,
                     block_mining_time_ms: block_time as u64,
@@ -1200,8 +1258,6 @@ Finished at: {}
                 self.next_mega_block_index += 1;
 
                 Self::insert_megablock(&megablock_db, &megablock)?;
-
-                actual_processing_ms = 0;
             }
 
             // process at most one block per loop pass
@@ -1213,7 +1269,7 @@ Finished at: {}
                     &canonical_sortition_tip,
                     self.dispatcher,
                     self.config.txindex,
-                    mega_mined_tenure.clone(),
+                    Some(mega_mining_tenure.clone()),
                 ) {
                     Ok(receipt_opt) => receipt_opt,
                     Err(ChainstateError::InvalidStacksBlock(msg)) => {
@@ -1244,16 +1300,20 @@ Finished at: {}
                 debug!("No more blocks to process (no receipts)");
                 break;
             };
+
             actual_processing_ms += start_actual.elapsed().as_millis();
 
-            if ready_tenure_blocks.len() == 1 {
-                // it was the last block
-                if let Some(ref tenure) = mega_mined_tenure {
-                    Self::update_megablock_actual_processing_time(
-                        &megablock_db,
-                        tenure,
-                        actual_processing_ms as u64,
-                    )?;
+            if separated_tenure_start.is_none() {
+                if ready_tenure_blocks.len() == 1 {
+                    // it was the last block
+                    if let Some(ref tenure) = mega_mined_tenure {
+                        Self::update_megablock_actual_processing_time(
+                            &megablock_db,
+                            tenure,
+                            actual_processing_ms as u64,
+                        )?;
+                        actual_processing_ms = 0;
+                    }
                 }
             }
 
